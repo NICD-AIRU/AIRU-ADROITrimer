@@ -110,7 +110,7 @@ as a QC aid.
 
 ## Notes / assumptions
 
-- I wasn't able to find a stored "neut dashboard" theme spec, so I matched the visual
+- unable to find a stored "neut dashboard" theme spec, so I matched the visual
   language already used across your other Shiny apps in this workspace (shinydashboard
   shell, `rv` reactiveValues store, DT tables, status colour-coding) with a dark
   navy/teal palette and green/red present/missing badges typical of neutralization-assay
