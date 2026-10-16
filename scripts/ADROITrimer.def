@@ -1,0 +1,252 @@
+Bootstrap: docker
+From: rocker/r-ver:4.3.3
+
+%labels
+    Maintainer      ADROITrimer Pipeline
+    Version         1.0.3
+    Description     Singularity container for ADROITrimer HIV-1 envelope \
+                    trimer sequence trimming/repair pipeline. Bundles R, \
+                    bio3d, MUSCLE v3.8, Python 3, and the batch wrapper.
+    R_packages      bio3d
+    External_tools  MUSCLE 3.8.1551
+
+%help
+    ADROITrimer v1.0.3 container.
+
+    The container bundles two entry points:
+
+    ── Single sequence ────────────────────────────────────────────────────
+    singularity run ADROITrimer.sif \
+        <input.fasta> <subtype> [muscle_exe]
+
+        input.fasta   Single-sequence protein FASTA (HIV-1 env)
+        subtype       HIV-1 subtype (e.g. B, C, A1)
+        muscle_exe    Optional: path to MUSCLE binary (default: bundled)
+
+    ── Batch (multi-sequence FASTA) ───────────────────────────────────────
+    singularity exec ADROITrimer.sif bash \
+        /opt/ADROITrimer/ADROITrimer.sh \
+        <multi.fasta> <subtype> /usr/local/bin/muscle \
+        /opt/ADROITrimer/ADROITrimer1_0-3.R
+
+    ── Reference FASTA ────────────────────────────────────────────────────
+    Three reference files must be present in required_files/ next to the
+    R script. The container looks for them at /home/kgopotso.phakwago/Data/Stuff/Thandeka/17_04_2026/ADROITrimer/required_files:
+        /home/kgopotso.phakwago/Data/Stuff/Thandeka/17_04_2026/ADROITrimer/required_files/HIV1_FLT_2016_env_PRO_cleanLastCol_final.fasta  (reference alignment)
+        /home/kgopotso.phakwago/Data/Stuff/Thandeka/17_04_2026/ADROITrimer/required_files/5fyl_trimer.pdb                                  (trimer PDB structure)
+        /home/kgopotso.phakwago/Data/Stuff/Thandeka/17_04_2026/ADROITrimer/required_files/5fyl_trimer.rsa                                  (solvent accessibility)
+    To supply your own:
+
+        singularity exec \
+            --bind /your/path/required_files:/home/kgopotso.phakwago/Data/Stuff/Thandeka/17_04_2026/ADROITrimer/required_files \
+            ADROITrimer.sif bash /home/kgopotso.phakwago/Data/Stuff/Thandeka/17_04_2026/ADROITrimer/ADROITrimer.sh ...
+
+%files
+    # ── Scripts ───────────────────────────────────────────────────────────
+    ADROITrimer1_0-3.R  /opt/ADROITrimer/ADROITrimer1_0-3.R
+    ADROITrimer.sh      /opt/ADROITrimer/ADROITrimer.sh
+
+    # ── Reference files (bundled from absolute host paths) ────────────────
+    /home/kgopotso.phakwago/Data/Stuff/Thandeka/17_04_2026/ADROITrimer/required_files/HIV1_FLT_2016_env_PRO_cleanLastCol_final.fasta /opt/ADROITrimer/required_files/HIV1_FLT_2016_env_PRO_cleanLastCol_final.fasta
+    /home/kgopotso.phakwago/Data/Stuff/Thandeka/17_04_2026/ADROITrimer/required_files/5fyl_trimer.pdb /opt/ADROITrimer/required_files/5fyl_trimer.pdb
+    /home/kgopotso.phakwago/Data/Stuff/Thandeka/17_04_2026/ADROITrimer/required_files/5fyl_trimer.rsa /opt/ADROITrimer/required_files/5fyl_trimer.rsa
+
+%post
+    set -e
+
+    # ── System packages ───────────────────────────────────────────────────
+    apt-get update -qq
+    apt-get install -y --no-install-recommends \
+        bash \
+        python3 \
+        python3-distutils \
+        wget \
+        curl \
+        ca-certificates \
+        build-essential \
+        gfortran \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        libxml2-dev \
+        libfontconfig1-dev \
+        libharfbuzz-dev \
+        libfribidi-dev \
+        libfreetype6-dev \
+        libpng-dev \
+        libtiff5-dev \
+        libjpeg-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        liblzma-dev \
+        libnetcdf-dev \
+        netcdf-bin \
+        libgit2-dev \
+        libsodium-dev \
+        pandoc
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+    # ── Isolate R library to a single container-internal path ────────────
+    export R_LIBS="/usr/local/lib/R/library"
+    export R_LIBS_USER="/usr/local/lib/R/library"
+    export R_LIBS_SITE="/usr/local/lib/R/library"
+    export R_ENVIRON_USER="/dev/null"
+    export R_PROFILE_USER="/dev/null"
+    mkdir -p /usr/local/lib/R/library
+    # Enforce library path at every R session startup
+    echo '.libPaths("/usr/local/lib/R/library")' \
+        > /usr/local/lib/R/etc/Rprofile.site
+
+    # ── R packages ────────────────────────────────────────────────────────
+    # Only install Depends/Imports — Suggests (ncdf4, testthat, rmarkdown)
+    # are not needed at runtime and several require extra system headers.
+    Rscript -e "
+      lib <- '/usr/local/lib/R/library'
+      .libPaths(lib)
+      install.packages(
+        'bio3d',
+        repos        = 'https://cloud.r-project.org',
+        lib          = lib,
+        dependencies = c('Depends', 'Imports', 'LinkingTo')
+      )
+      library(bio3d)
+      cat('bio3d', as.character(packageVersion('bio3d')), 'installed OK\n')
+    "
+
+    # ── MUSCLE v3.8 ───────────────────────────────────────────────────────
+    # The R script calls:  muscle -in <f> -out <f> -maxiters 2
+    # This is the v3 CLI; MUSCLE v5 uses a different interface.
+    # Unpack the static binary from the Bioconda conda package directly —
+    # no conda/mamba runtime required inside the container.
+    python3 - <<'PYEOF'
+import urllib.request, tarfile, os, stat, shutil, tempfile
+
+URLS = [
+    "https://anaconda.org/bioconda/muscle/3.8.1551/download/linux-64/muscle-3.8.1551-h7d875b9_6.tar.bz2",
+    "https://conda.anaconda.org/bioconda/linux-64/muscle-3.8.1551-h7d875b9_6.tar.bz2",
+]
+
+dest = "/usr/local/bin/muscle"
+tmp  = tempfile.mkdtemp()
+pkg  = os.path.join(tmp, "muscle.tar.bz2")
+
+downloaded = False
+for url in URLS:
+    try:
+        print(f"Trying: {url}")
+        urllib.request.urlretrieve(url, pkg)
+        downloaded = True
+        break
+    except Exception as e:
+        print(f"  Failed: {e}")
+
+if not downloaded:
+    raise RuntimeError("All MUSCLE download URLs failed")
+
+with tarfile.open(pkg, "r:bz2") as tar:
+    member = next(m for m in tar.getmembers() if m.name.endswith("bin/muscle"))
+    member.name = "muscle_bin"
+    tar.extract(member, tmp)
+
+shutil.copy(os.path.join(tmp, "muscle_bin"), dest)
+os.chmod(dest, os.stat(dest).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+shutil.rmtree(tmp)
+print(f"MUSCLE installed to {dest}")
+PYEOF
+
+    # ── Permissions and directory structure ───────────────────────────────
+    chmod +x /opt/ADROITrimer/ADROITrimer.sh
+    mkdir -p /opt/ADROITrimer/required_files
+    chmod -R 755 /opt/ADROITrimer
+
+    # ── Verify all components ─────────────────────────────────────────────
+    echo "--- R library isolation ---"
+    Rscript -e "print(.libPaths())"
+    echo "--- bio3d ---"
+    Rscript -e "library(bio3d); cat('bio3d', as.character(packageVersion('bio3d')), 'OK\n')"
+    echo "--- MUSCLE ---"
+    muscle -version 2>&1 | head -1 || echo "muscle binary present"
+    echo "--- bash ---"
+    bash --version | head -1
+    echo "--- python3 ---"
+    python3 --version
+
+%environment
+    # ── Isolate R completely from the host environment ────────────────────
+    export R_LIBS="/usr/local/lib/R/library"
+    export R_LIBS_USER="/usr/local/lib/R/library"
+    export R_LIBS_SITE="/usr/local/lib/R/library"
+    export R_ENVIRON_USER="/dev/null"
+    export R_PROFILE_USER="/dev/null"
+
+    # Container binaries take precedence — host PATH is not inherited
+    export PATH="/usr/local/bin:/usr/bin:/bin"
+
+    # Convenience variable pointing to bundled scripts
+    export ADROITRIMER_DIR="/opt/ADROITrimer"
+
+%runscript
+    #!/bin/bash
+    # Default entry point: single-sequence mode
+    #   singularity run ADROITrimer.sif <input.fasta> <subtype> [muscle_exe]
+
+    if [ "$#" -lt 2 ]; then
+        echo "Usage: singularity run ADROITrimer.sif <input.fasta> <subtype> [muscle_exe]"
+        echo ""
+        echo "For multi-sequence (batch) input use:"
+        echo "  singularity exec ADROITrimer.sif bash \\"
+        echo "      /opt/ADROITrimer/ADROITrimer.sh \\"
+        echo "      <multi.fasta> <subtype> /usr/local/bin/muscle \\"
+        echo "      /opt/ADROITrimer/ADROITrimer1_0-3.R"
+        exit 1
+    fi
+
+    INPUT_FASTA="$1"
+    SUBTYPE="$2"
+    MUSCLE_EXE="${3:-/usr/local/bin/muscle}"
+
+    if [ ! -f "${INPUT_FASTA}" ]; then
+        echo "ERROR: Input FASTA not found: ${INPUT_FASTA}"
+        exit 1
+    fi
+
+    exec Rscript /opt/ADROITrimer/ADROITrimer1_0-3.R \
+        "${INPUT_FASTA}" \
+        "${SUBTYPE}" \
+        "${MUSCLE_EXE}"
+
+%test
+    echo "--- R version ---"
+    Rscript --version
+
+    echo "--- R library isolation ---"
+    Rscript -e "
+      paths <- .libPaths()
+      print(paths)
+      stopifnot(all(grepl('^/usr/local/lib/R', paths)))
+      cat('Library isolation OK\n')
+    "
+
+    echo "--- bio3d ---"
+    Rscript -e "library(bio3d); cat('bio3d', as.character(packageVersion('bio3d')), 'OK\n')"
+
+    echo "--- MUSCLE ---"
+    muscle -version 2>&1 | head -1 || echo "muscle binary present"
+
+    echo "--- Scripts present and executable ---"
+    test -f /opt/ADROITrimer/ADROITrimer1_0-3.R  && echo "R script OK"        || echo "MISSING: ADROITrimer1_0-3.R"
+    test -f /opt/ADROITrimer/ADROITrimer.sh       && echo "Batch wrapper OK"   || echo "MISSING: ADROITrimer.sh"
+    test -x /opt/ADROITrimer/ADROITrimer.sh       && echo "Wrapper executable" || echo "NOT EXECUTABLE: ADROITrimer.sh"
+
+    echo "--- Reference files ---"
+    test -f /opt/ADROITrimer/required_files/HIV1_FLT_2016_env_PRO_cleanLastCol_final.fasta && echo "Reference FASTA OK" || echo "MISSING: reference FASTA"
+    test -f /opt/ADROITrimer/required_files/5fyl_trimer.pdb && echo "PDB OK"               || echo "MISSING: 5fyl_trimer.pdb"
+    test -f /opt/ADROITrimer/required_files/5fyl_trimer.rsa && echo "RSA OK"               || echo "MISSING: 5fyl_trimer.rsa"
+
+    echo "--- python3 ---"
+    python3 --version
+
+    echo "--- bash ---"
+    bash --version | head -1
+
+    echo "All tests passed."

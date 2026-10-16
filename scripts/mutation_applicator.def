@@ -1,0 +1,568 @@
+# =============================================================================
+# mutation_applicator.def
+# =============================================================================
+# Singularity container for mutation_applicator.py
+#
+# Applies user-defined named mutation sets (e.g. 3mut, 2G) to ADROITrimer
+# *_DS-SOSIP-RnS_NtCt-tags.fasta outputs, and regenerates a Mutations.csv
+# for each output in the exact format produced by the original R script.
+#
+# BUILD
+# -----
+#   singularity build mutation_applicator.sif mutation_applicator.def
+#   # or, if you don't have root, use --fakeroot:
+#   singularity build --fakeroot mutation_applicator.sif mutation_applicator.def
+#
+# RUN
+# ---
+#   # All samples in a folder:
+#   singularity exec \
+#       --bind /path/to/data:/data \
+#       mutation_applicator.sif \
+#       mutation_applicator /data/run_folder/ --outdir /data/results/
+#
+#   # Explicit files:
+#   singularity exec \
+#       --bind /path/to/data:/data \
+#       mutation_applicator.sif \
+#       mutation_applicator /data/A1_DS-SOSIP-RnS_NtCt-tags.fasta \
+#                           /data/B_DS-SOSIP-RnS_NtCt-tags.fasta \
+#                           --outdir /data/results/
+#
+#   # Only 3mut, no base output:
+#   singularity exec \
+#       --bind /path/to/data:/data \
+#       mutation_applicator.sif \
+#       mutation_applicator /data/ --outdir /data/results/ --sets 3mut --no-base
+#
+#   # Or use the container directly as a runscript (same arguments):
+#   singularity run \
+#       --bind /path/to/data:/data \
+#       mutation_applicator.sif \
+#       /data/ --outdir /data/results/
+#
+# The script inside is at /usr/local/bin/mutation_applicator
+# =============================================================================
+
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Author          ADROITrimer pipeline
+    Version         1.0.0
+    Description     Applies named HIV-1 gp160 mutation sets to ADROITrimer \
+                    FASTA outputs and regenerates Mutations.csv files
+    Python          3.10 (Ubuntu 22.04 system Python)
+
+%help
+    Applies user-defined mutation sets (e.g. 3mut, 2G) to one or more
+    ADROITrimer *_DS-SOSIP-RnS_NtCt-tags.fasta files. For every output it
+    writes a new FASTA and a Mutations.csv in the exact format of the
+    original R script.
+
+    Each input FASTA must have a matching *_FullAnalysis.csv in the same
+    directory (produced by the same ADROITrimer run).
+
+    USAGE EXAMPLES
+    ──────────────
+    # All samples in a bound directory, all mutation-set combinations:
+    singularity run --bind /your/data:/data mutation_applicator.sif \
+        /data/run_folder/ --outdir /data/results/
+
+    # Explicit FASTA files, 3mut set only:
+    singularity exec --bind /your/data:/data mutation_applicator.sif \
+        mutation_applicator \
+        /data/A1_DS-SOSIP-RnS_NtCt-tags.fasta \
+        /data/B_DS-SOSIP-RnS_NtCt-tags.fasta \
+        --outdir /data/results/ --sets 3mut
+
+    # Skip the unmodified base output:
+    singularity run --bind /your/data:/data mutation_applicator.sif \
+        /data/ --outdir /data/results/ --no-base
+
+    MUTATION SETS  (edit MUTATION_SETS in the script to add more)
+    ──────────────
+    3mut   : 302M, 320L, 329P
+    2G     : 569G, 636G
+
+    All non-empty combinations are produced automatically unless --sets
+    restricts the selection.
+
+%post
+    # ── System setup ──────────────────────────────────────────────────────────
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-distutils \
+        ca-certificates
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+    # Confirm Python is available
+    python3 --version
+
+    # ── Embed mutation_applicator.py ──────────────────────────────────────────
+    # The script uses only the Python standard library; no pip installs needed.
+    cat > /usr/local/bin/mutation_applicator.py << 'PYEOF'
+#!/usr/bin/env python3
+"""
+mutation_applicator.py
+======================
+Batch-processes one or more ADROITrimer *_DS-SOSIP-RnS_NtCt-tags.fasta files,
+applies user-defined named mutation sets (e.g. 3mut, 2G), and for every
+output writes:
+  * A new FASTA with the mutations applied
+  * A Mutations.csv that exactly matches the format produced by the R script
+    (Position, HXB2, Mutation columns -- Position values mirror R's `index`
+     variable starting at 4, so they are identical to the original R output)
+
+For each FASTA the script auto-locates the matching *_FullAnalysis.csv in
+the same directory.  Both files are required; missing pairs are skipped with
+a warning.
+
+Usage
+-----
+  # All FASTA files in a directory, all mutation-set combinations:
+  mutation_applicator /path/to/fastas/ --outdir results/
+
+  # Explicit file list (mix files and directories freely):
+  mutation_applicator sample1_DS-SOSIP-RnS_NtCt-tags.fasta \\
+                      sample2_DS-SOSIP-RnS_NtCt-tags.fasta \\
+                      --outdir results/
+
+  # Only 3mut set, skip the unmodified base output:
+  mutation_applicator /path/to/fastas/ --sets 3mut --no-base
+
+  # 3mut + 2G separate AND combined (3 outputs per sample):
+  mutation_applicator /path/to/fastas/ --sets 3mut 2G --outdir results/
+
+Output files per sample (example prefix "H703"):
+  H703_base_DS-SOSIP-RnS_NtCt.fasta    + H703_base_Mutation.csv
+  H703_3mut_DS-SOSIP-RnS_NtCt.fasta    + H703_3mut_Mutation.csv
+  H703_2G_DS-SOSIP-RnS_NtCt.fasta      + H703_2G_Mutation.csv
+  H703_3mut_2G_DS-SOSIP-RnS_NtCt.fasta + H703_3mut_2G_Mutation.csv
+
+Dependencies: standard library only -- no pip installs needed.
+"""
+
+import argparse
+import csv
+import glob as _glob
+import itertools
+import sys
+from pathlib import Path
+
+
+# =============================================================================
+# USER-CONFIGURABLE MUTATION SETS
+# Keys   = set name (used in --sets and in output filenames)
+# Values = {HXB2_position (int): target_amino_acid (str)}
+#
+# To add a new set, simply insert another entry here -- no other changes needed.
+# =============================================================================
+MUTATION_SETS = {
+    "3mut": {302: "M", 320: "L", 329: "P"},
+    "2G":   {569: "G", 636: "G"},
+}
+
+
+# =============================================================================
+# TERMINAL TAGS  (mirror the R script for _DS-SOSIP-RnS_NtCt-tags.fasta)
+# =============================================================================
+NT_TAG = "MPMGSLQPLATLYLLGMLVASVLAQQAENL"   # 30 aa N-terminal leader
+CT_TAG = "GSAPTKAKRRVVQREKR"                 # 17 aa C-terminal tag
+
+
+# =============================================================================
+# HARD-WIRED STRUCTURAL MUTATIONS
+# Mirrors the R "Additional mutations" block exactly.
+# Format: {hxb2_pos: (forced_aa_string, Mutation_csv_label)}
+# The "RRR" at position 511 is handled specially: it adds THREE residues
+# and produces three rows in the CSV (511, 511a, 511b).
+# =============================================================================
+STRUCTURAL = {
+    201: ("C",   "DS"),
+    433: ("C",   "DS"),
+    501: ("C",   "SOSIP"),
+    559: ("P",   "SOSIP"),
+    605: ("C",   "SOSIP"),
+    508: ("R",   "6R"),
+    509: ("R",   "6R"),
+    510: ("R",   "6R"),
+    511: ("RRR", "6R"),
+    535: ("N",   "Stabilization"),
+    556: ("P",   "Stabilization"),
+    588: ("E",   "Stabilization"),
+    589: ("V",   "Stabilization"),
+    651: ("F",   "Stabilization"),
+    655: ("I",   "Stabilization"),
+    658: ("V",   "Stabilization"),
+}
+
+SKIP_POSITIONS = set(range(1, 35))   # HXB2 1-34: N-terminal signal peptide
+TRUNCATE_AT    = 665                  # stop before this HXB2 position
+FASTA_SUFFIX   = "_DS-SOSIP-RnS_NtCt-tags.fasta"
+CSV_SUFFIX     = "_FullAnalysis.csv"
+
+
+# =============================================================================
+# FASTA I/O
+# =============================================================================
+
+def write_fasta(path, seq_id, sequence, wrap=60):
+    """Write a single-record FASTA with lines wrapped at `wrap` characters."""
+    with open(path, "w") as fh:
+        fh.write(f">{seq_id}\n")
+        for i in range(0, len(sequence), wrap):
+            fh.write(sequence[i : i + wrap] + "\n")
+    print(f"      FASTA  -> {path.name}  ({len(sequence)} aa)")
+
+
+# =============================================================================
+# FullAnalysis CSV reader
+# =============================================================================
+
+def read_full_analysis(csv_path):
+    """Parse *_FullAnalysis.csv; return a list of row dicts."""
+    with open(csv_path, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+# =============================================================================
+# SEQUENCE BUILDER
+# Mirrors R's "Additional mutations" loop for _DS-SOSIP-RnS_NtCt-tags.fasta.
+#
+# R initialises  `index <- 4`  because the intermediate "_DS-SOSIP-RnS.fasta"
+# prepends "AENL" (4 aa), so the first HIV residue (HXB2 35) lands at
+# position 5.  We replicate this so the Position column in the CSV is
+# byte-for-byte identical to what the R script produces.
+# =============================================================================
+
+def build_base(rows):
+    """
+    Walk the FullAnalysis rows and produce:
+
+      hiv_seq        : str  -- HIV-only sequence (no Nt/Ct tags, gaps removed)
+      hxb2_to_seqidx : dict -- {hxb2_pos_int -> 0-based index in hiv_seq}
+                               Only non-insert, non-structural positions stored;
+                               used to apply user mutations later.
+      hxb2_to_pos    : dict -- {hxb2_pos_int -> R index value (= Position in CSV)}
+                               Same keys as hxb2_to_seqidx.
+      base_log       : list -- [(Position, HXB2_label, Mutation_label)] ready
+                               for writing to Mutations.csv.
+    """
+    hiv_chars      = []
+    hxb2_to_seqidx = {}
+    hxb2_to_pos    = {}
+    base_log       = []
+
+    index = 4    # mirrors `index <- 4` in the R script
+
+    for row in rows:
+        try:
+            pos = int(str(row["no_hxb2"]).strip())
+        except ValueError:
+            continue   # safety net only
+
+        insert       = row["insert_hxb2"]
+        repaired     = str(row["repaired_aa"]).strip()
+        mutation_col = str(row.get("mutation", "NA")).strip()
+
+        # 1. Skip N-terminal signal peptide
+        if pos in SKIP_POSITIONS:
+            continue
+
+        # 2. Truncate after gp41
+        if pos >= TRUNCATE_AT:
+            break
+
+        # 3. Structural / hard-wired mutations (non-insert positions only)
+        if pos in STRUCTURAL and insert == " ":
+            aa_str, label = STRUCTURAL[pos]
+            if aa_str == "RRR":
+                # 6R at position 511: three R residues logged as 511, 511a, 511b
+                for k, ch in enumerate(aa_str):
+                    index += 1
+                    hiv_chars.append(ch)
+                    hxb2_label = str(pos) if k == 0 else f"{pos}{'ab'[k - 1]}"
+                    base_log.append((index, hxb2_label, label))
+            else:
+                index += 1
+                hxb2_to_seqidx[pos] = len(hiv_chars)
+                hxb2_to_pos[pos]    = index
+                hiv_chars.append(aa_str)
+                base_log.append((index, str(pos), label))
+            continue
+
+        # 4. Skip alignment gaps
+        if repaired == "-":
+            continue
+
+        # 5. Normal residue (includes insert positions relative to HXB2)
+        index += 1
+        if insert == " ":
+            hxb2_to_seqidx[pos] = len(hiv_chars)
+            hxb2_to_pos[pos]    = index
+        hiv_chars.append(repaired)
+
+        # Record repair mutations (non-NA mutation column = residue was changed)
+        if mutation_col not in ("NA", "", "na"):
+            hxb2_label = str(pos) if insert == " " else f"{pos}_{insert}"
+            base_log.append((index, hxb2_label, f"Repair_{mutation_col}"))
+
+    return "".join(hiv_chars), hxb2_to_seqidx, hxb2_to_pos, base_log
+
+
+# =============================================================================
+# POINT-MUTATION APPLICATOR
+# =============================================================================
+
+def apply_mutations(hiv_seq, hxb2_to_seqidx, hxb2_to_pos,
+                    mutations, base_log, set_label):
+    """
+    Overlay user-defined point mutations on hiv_seq.
+
+    Returns (mutated_hiv_seq, updated_log) where updated_log = base_log plus
+    new entries for each applied mutation, sorted by Position.
+
+    Mutation label format:  Mut_{original_aa}{hxb2_pos}{new_aa}_{set_label}
+    e.g.  Mut_T302M_3mut
+    """
+    seq_list  = list(hiv_seq)
+    extra_log = []
+
+    for pos, new_aa in sorted(mutations.items()):
+        if pos not in hxb2_to_seqidx:
+            print(f"        [WARN] HXB2 {pos} not in sequence "
+                  f"(gap, insert, or out of range) -- skipped.", file=sys.stderr)
+            continue
+
+        idx    = hxb2_to_seqidx[pos]
+        old_aa = seq_list[idx]
+
+        if old_aa == new_aa:
+            print(f"        [INFO] HXB2 {pos}: already '{new_aa}', no change.")
+            continue
+
+        seq_list[idx] = new_aa
+        position      = hxb2_to_pos[pos]
+        extra_log.append((position, str(pos), f"Mut_{old_aa}{pos}{new_aa}_{set_label}"))
+        print(f"        HXB2 {pos}: {old_aa} -> {new_aa}  "
+              f"(seq idx {idx},  Position {position})")
+
+    combined = sorted(base_log + extra_log, key=lambda x: x[0])
+    return "".join(seq_list), combined
+
+
+# =============================================================================
+# Mutations.csv writer  (replicates R's write.csv with quote=FALSE)
+# =============================================================================
+
+def write_mutations_csv(path, log):
+    """
+    Write Mutations.csv with columns  Position,HXB2,Mutation
+    in the exact same plain-text format as R's write.csv(quote=FALSE).
+    """
+    with open(path, "w", newline="\n") as fh:
+        fh.write("Position,HXB2,Mutation\n")
+        for position, hxb2, mutation in log:
+            fh.write(f"{position},{hxb2},{mutation}\n")
+    print(f"      CSV    -> {path.name}  ({len(log)} entries)")
+
+
+# =============================================================================
+# FILE COLLECTION
+# =============================================================================
+
+def collect_fastas(inputs):
+    """
+    Resolve a mixed list of file paths, directories and shell globs into a
+    deduplicated list of *_DS-SOSIP-RnS_NtCt-tags.fasta Path objects.
+    """
+    collected = []
+    for inp in inputs:
+        p = Path(inp)
+        if p.is_dir():
+            collected.extend(sorted(p.glob(f"*{FASTA_SUFFIX}")))
+        else:
+            matched = sorted(_glob.glob(inp))
+            if matched:
+                collected.extend(Path(m) for m in matched)
+            elif p.exists():
+                collected.append(p)
+            else:
+                print(f"  [WARN] No files matched: {inp}", file=sys.stderr)
+
+    seen, unique = set(), []
+    for p in collected:
+        key = str(p.resolve())
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Batch-process ADROITrimer *_DS-SOSIP-RnS_NtCt-tags.fasta files "
+            "with named mutation sets. Writes one FASTA + one Mutations.csv "
+            "per combination, all in a single output directory."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "inputs", nargs="+", metavar="FASTA_OR_DIR",
+        help=(
+            f"One or more *{FASTA_SUFFIX} files, directories, or shell globs. "
+            "Each FASTA must have a co-located *_FullAnalysis.csv."
+        ),
+    )
+    parser.add_argument(
+        "--sets", nargs="*", default=list(MUTATION_SETS.keys()), metavar="SET",
+        help=(
+            f"Named mutation sets to apply. Available: {list(MUTATION_SETS.keys())}. "
+            "Every non-empty combination is produced automatically. Default: all."
+        ),
+    )
+    parser.add_argument(
+        "--outdir", default="mutation_outputs",
+        help=(
+            "Single directory for ALL output FASTAs and CSVs "
+            "(created if absent). Default: ./mutation_outputs/"
+        ),
+    )
+    parser.add_argument(
+        "--no-base", action="store_true",
+        help="Skip the unmodified base FASTA + CSV (only write mutated variants).",
+    )
+    args = parser.parse_args()
+
+    for name in (args.sets or []):
+        if name not in MUTATION_SETS:
+            sys.exit(
+                f"ERROR: Unknown mutation set '{name}'. "
+                f"Available: {list(MUTATION_SETS.keys())}"
+            )
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    fasta_files = collect_fastas(args.inputs)
+    if not fasta_files:
+        sys.exit("ERROR: No matching FASTA files found.")
+
+    requested = args.sets or []
+    combos = []
+    for r in range(1, len(requested) + 1):
+        combos.extend(itertools.combinations(requested, r))
+
+    print(f"\n{'='*62}")
+    print(f"  Samples found : {len(fasta_files)}")
+    print(f"  Mutation sets : {requested}")
+    print(f"  Combinations  : {len(combos)}  (plus base per sample)")
+    print(f"  Output dir    : {outdir.resolve()}")
+    print(f"{'='*62}")
+
+    ok = skipped = 0
+
+    for fasta_path in fasta_files:
+        print(f"\n{'--'*31}")
+        print(f"  {fasta_path.name}")
+
+        if not fasta_path.name.endswith(FASTA_SUFFIX):
+            print(f"    [SKIP] Does not end with '{FASTA_SUFFIX}'.", file=sys.stderr)
+            skipped += 1
+            continue
+
+        prefix   = fasta_path.name[: -len(FASTA_SUFFIX)]
+        csv_path = fasta_path.parent / f"{prefix}{CSV_SUFFIX}"
+
+        if not csv_path.exists():
+            print(
+                f"    [SKIP] Matching FullAnalysis CSV not found:\n"
+                f"           {csv_path}",
+                file=sys.stderr,
+            )
+            skipped += 1
+            continue
+
+        print(f"    Reading  : {csv_path.name}")
+        rows = read_full_analysis(csv_path)
+
+        print(f"    Building base sequence ...")
+        hiv_seq, hxb2_to_seqidx, hxb2_to_pos, base_log = build_base(rows)
+        base_full = NT_TAG + hiv_seq + CT_TAG
+        print(
+            f"    Sequence : {len(NT_TAG)} (Nt) + {len(hiv_seq)} (HIV) "
+            f"+ {len(CT_TAG)} (Ct) = {len(base_full)} aa  |  "
+            f"{len(base_log)} mutations logged"
+        )
+
+        if not args.no_base:
+            print(f"    -- base (no extra mutations) --")
+            write_fasta(
+                outdir / f"{prefix}_base_DS-SOSIP-RnS_NtCt.fasta",
+                f"{prefix}_base", base_full,
+            )
+            write_mutations_csv(outdir / f"{prefix}_base_Mutation.csv", base_log)
+
+        for combo in combos:
+            label = "_".join(combo)
+            print(f"    -- {label} --")
+
+            merged = {}
+            for name in combo:
+                for pos, aa in MUTATION_SETS[name].items():
+                    if pos in merged and merged[pos] != aa:
+                        print(
+                            f"      [WARN] HXB2 {pos} conflict -- "
+                            f"'{merged[pos]}' overridden by '{aa}' (set '{name}').",
+                            file=sys.stderr,
+                        )
+                    merged[pos] = aa
+
+            mutated_hiv, ext_log = apply_mutations(
+                hiv_seq, hxb2_to_seqidx, hxb2_to_pos, merged, base_log, label
+            )
+            mutated_full = NT_TAG + mutated_hiv + CT_TAG
+
+            write_fasta(
+                outdir / f"{prefix}_{label}_DS-SOSIP-RnS_NtCt.fasta",
+                f"{prefix}_{label}", mutated_full,
+            )
+            write_mutations_csv(outdir / f"{prefix}_{label}_Mutation.csv", ext_log)
+
+        ok += 1
+
+    print(f"\n{'='*62}")
+    print(f"  Done.  Processed: {ok}   Skipped: {skipped}")
+    print(f"  All outputs in: {outdir.resolve()}")
+    print(f"{'='*62}\n")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+    # Make it executable and symlink as a bare command
+    chmod +x /usr/local/bin/mutation_applicator.py
+    ln -s /usr/local/bin/mutation_applicator.py /usr/local/bin/mutation_applicator
+
+    echo "=== Build complete ==="
+    python3 --version
+    python3 /usr/local/bin/mutation_applicator.py --help
+
+%environment
+    export LC_ALL=C
+    export LANG=C
+
+%runscript
+    # `singularity run container.sif <args>` passes all args to the script
+    exec python3 /usr/local/bin/mutation_applicator.py "$@"
